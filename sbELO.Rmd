@@ -1,0 +1,906 @@
+---
+title: "sbELO"
+author: "Ryan King"
+date: "4/2/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+pacman::p_load(tidyverse, dplyr, readr, knitr, kableExtra)
+```
+
+```{r Run Expectancy Data, eval=F}
+BP_codes <- c(2800999, 2556148, 2021095, 1918852, 1819115, 1657937, 1405164, 1091223, 975409, 1048691,
+              1051479, 1051478, 1062090, 1063872, 1065011, 1066387, 1074963, 1073241, 1072081, 1051477,
+              1064747, 1059999, 1078352, 1240228, 1240231, 1117604, 1101150, 1104746, 1056051, 1094922,
+              1056016, 1252333, 1093208, 1407287, 1072040, 1407286, 1102517, 1068043, 1061211, 1052892,
+              1096282, 1388871, 1375973, 1470730, 1470731, 1392523, 1112191, 1054257, 1099985, 1054240)
+
+library(rvest)
+
+for(i in 1:length(BP_codes)){
+  url <- paste0("https://legacy.baseballprospectus.com/sortable/index.php?cid=", BP_codes[i])
+  webpage <- read_html(url)
+  re.html <- html_nodes(webpage, ".right")
+  re.table <- matrix(html_text(re.html), ncol = 5, byrow = T)
+  if(i == 1){
+    RE <- data.frame(Year = re.table[,1],
+                     Runners = re.table[,2],
+                     Outs0 = re.table[,3],
+                     Outs1 = re.table[,4],
+                     Outs2 = re.table[,5], stringsAsFactors = F) %>%
+      mutate_at(vars(-Runners), funs(as.numeric))
+  }else{
+    RE <- data.frame(Year = re.table[,1],
+                     Runners = re.table[,2],
+                     Outs0 = re.table[,3],
+                     Outs1 = re.table[,4],
+                     Outs2 = re.table[,5], stringsAsFactors = F) %>%
+      mutate_at(vars(-Runners), funs(as.numeric)) %>%
+      bind_rows(RE)
+  }
+  Sys.sleep(abs(rnorm(1,6,1.5)))
+}
+write_csv(RE, "RE_2019_1970.csv")
+```
+
+```{r Load in RE}
+RE <- read_csv("RE_2019_1970.csv")
+```
+
+```{r SB Rates}
+bayes_sb_rates <- function(df){
+  sb_rates <- df %>%
+    group_by(Base1, Event1) %>%
+    summarize(count = n()) %>%
+    as.data.frame() %>%
+    reshape2::dcast(Base1 ~ Event1) %>%
+    mutate_at(vars(CS, SB), funs(replace_na))
+  
+  alpha2 <- 1500
+  beta2 <- 500
+  alpha3 <- 240
+  beta3 <- 60
+  alphaH <- 6
+  betaH <- 24
+  
+  SB2 <- sb_rates %>% filter(Base1 == "2") %>% pull(SB)
+  CS2 <- sb_rates %>% filter(Base1 == "2") %>% pull(CS)
+  post2 <- (alpha2+SB2)/(alpha2+beta2+SB2+CS2)
+  
+  SB3 <- sb_rates %>% filter(Base1 == "3") %>% pull(SB)
+  CS3 <- sb_rates %>% filter(Base1 == "3") %>% pull(CS)
+  post3 <- (alpha3+SB3)/(alpha3+beta3+SB3+CS3)
+  
+  SBH <- sb_rates %>% filter(Base1 == "H") %>% pull(SB)
+  CSH <- sb_rates %>% filter(Base1 == "H") %>% pull(CS)
+  postH <- (alphaH+SBH)/(alphaH+betaH+SBH+CSH)
+  return(data.frame(Second = post2, Third = post3, Home = postH, stringsAsFactors = F))
+}
+```
+
+```{r Big Loop, cache = TRUE}
+first_year <- 1978
+last_year <- 2019
+historic_runners <- historic_catchers <- historic_pitchers <- data.frame(id = "", CS = 0, SB = 0, ELO = 0, Season = 1776, stringsAsFactors = F)
+historic_runlog <- data.frame(game_date = as.Date("3000-01-01"), r1_id = "", pos2_fld_id = "", pit_id = "", Base1 = "", Event1 = "", pre_rELO = 0, pre_cELO = 0, pre_pELO = 0, exp_runs = 0, post_runs = 0, post_rELO = 0, post_cELO = 0, post_pELO = 0, delta_rELO = 0, delta_cELO = 0, delta_pELO = 0, stringsAsFactors = F)
+for(year in first_year:last_year){
+  if(year == first_year){
+    alldat <- read_csv(paste0("~/download.folder/unzipped/all", year, ".csv"))
+
+    events0 <- alldat %>% 
+      filter(grepl("SB",event_tx) | grepl("PO", event_tx) | grepl("CS", event_tx))
+    
+    baseruns0 <- events0 %>%
+      group_by(1:nrow(.)) %>%
+      mutate(Event1 = case_when(grepl("POCS", event_tx) ~ "POCS",
+                                grepl("PO", event_tx) ~ "PO",
+                                grepl("CS", event_tx) ~ "CS",
+                                grepl("SB", event_tx) ~ "SB",
+                                TRUE ~ "FIX ME"),
+             Base1 = case_when(grepl("POCS", event_tx) ~ substr(strsplit(event_tx, "POCS")[[1]][2],1,1),
+                               grepl("PO", event_tx) ~ substr(strsplit(event_tx, "PO")[[1]][2],1,1),
+                               grepl("CS", event_tx) ~ substr(strsplit(event_tx, "CS")[[1]][2],1,1),
+                               grepl("SB", event_tx) ~ substr(strsplit(event_tx, "SB")[[1]][2],1,1),
+                               TRUE ~ "FIX ME"),
+             r1_id = case_when(Event1 %in% c("POCS", "CS", "SB") & Base1 == "H" ~ base3_run_id,
+                               Event1 %in% c("POCS", "CS", "SB") & Base1 == "3" ~ base2_run_id,
+                               Event1 %in% c("POCS", "CS", "SB") & Base1 == "2" ~ base1_run_id,
+                               Event1 == "PO" & Base1 == "3" ~ base3_run_id,
+                               Event1 == "PO" & Base1 == "2" ~ base2_run_id,
+                               Event1 == "PO" & Base1 == "1" ~ base1_run_id,
+                               TRUE ~ "FIX ME"),
+             Event2 = case_when(length(strsplit(event_tx, "SB")[[1]]) > 2 ~ "SB",
+                                length(strsplit(event_tx, "POCS")[[1]]) > 2 ~ "FIX ME",
+                                length(strsplit(event_tx, "PO")[[1]]) > 2 ~ "FIX ME",
+                                length(strsplit(event_tx, "CS")[[1]]) > 2 ~ "FIX ME",
+                                TRUE ~ NA_character_),
+             Base2 = case_when(length(strsplit(event_tx, "SB")[[1]]) > 2  & grepl("SB", event_tx) ~ substr(strsplit(event_tx, "SB")[[1]][3],1,1),
+                               length(strsplit(event_tx, "POCS")[[1]]) > 2 ~ "FIX ME",
+                               length(strsplit(event_tx, "PO")[[1]]) > 2 ~ "FIX ME",
+                               length(strsplit(event_tx, "CS")[[1]]) > 2 ~ "FIX ME",
+                               TRUE ~ NA_character_),
+             r2_id = case_when(!is.na(Event2) & Event2 == "SB" & Base2 == "H" ~ base3_run_id,
+                               !is.na(Event2) & Event2 == "SB" & Base2 == "3" ~ base2_run_id,
+                               !is.na(Event2) & Event2 == "SB" & Base2 == "2" ~ base1_run_id,
+                               !is.na(Event2) ~ "FIX ME",
+                               TRUE ~ NA_character_),
+             primary_defender = case_when(grepl("POCS", event_tx) ~ substr(strsplit(event_tx, "POCS")[[1]][2],3,3),
+                                          grepl("PO", event_tx) ~ substr(strsplit(event_tx, "PO")[[1]][2],3,3),
+                                          grepl("CS", event_tx) ~ substr(strsplit(event_tx, "CS")[[1]][2],3,3),
+                                          grepl("SB", event_tx) ~ NA_character_,
+                                          TRUE ~ "FIX ME"),
+             game_date = substr(game_id, 4, nchar(game_id))) %>%
+      as.data.frame() %>%
+      select(game_date, pit_id, pos2_fld_id, r1_id, Base1, Event1, r2_id, Base2, Event2, primary_defender) %>%
+      arrange(game_date) %>%
+      filter(Event1 %in% c("SB", "CS"))
+    
+    # single or double steal?
+    for(i in 1:nrow(baseruns0)){
+      if(is.na(baseruns0[i,"r2_id"])){
+        r_id <- "r1_id"
+        base <- "Base1"
+        event <- "Event1"
+      }else{
+        base1 <- baseruns0[i,"Base1"]
+        base2 <- baseruns0[i,"Base2"]
+        primary_runner <- case_when(base2 == "H" & base1 == 2 ~ 1,
+                                    base1 == "H" & base2 == 2 ~ 2,
+                                    base2 == "H" ~ 2,
+                                    base1 == "H" ~ 1,
+                                    base1 == 2 ~ 2,
+                                    base1 == 3 ~ 1)
+        r_id <- paste0("r", primary_runner, "_id")
+        base <- paste0("Base", primary_runner)
+        event <- paste0("Event", primary_runner)
+      }
+      baseruns0[i, c("r1_id", "Base1", "Event1")] <- baseruns0[i, c(r_id, base, event)]
+    }
+    baseruns0 <- baseruns0 %>% select(-r2_id, -Base2, -Event2)
+    
+    runners0 <- data.frame(id = unique(c(baseruns0$r1_id, baseruns0$r2_id)), ELO = 1000, stringsAsFactors = F)
+    catchers0 <- data.frame(id = unique(baseruns0$pos2_fld_id), ELO = 1000, stringsAsFactors = F)
+    pitchers0 <- data.frame(id = unique(baseruns0$pit_id), ELO = 1000, stringsAsFactors = F)
+    
+    runlog0 <- baseruns0 %>%
+      select(game_date, r1_id, pos2_fld_id, pit_id, Base1, Event1) %>%
+      mutate(pre_rELO = 0,
+             pre_cELO = 0,
+             pre_pELO = 0,
+             prob_safe = 0,
+             post_rELO = 0,
+             post_cELO = 0,
+             post_pELO = 0)
+    
+    for(i in 1:nrow(baseruns0)){
+      # starting ELO values
+      cur_rELO <- runners0 %>%
+        inner_join(baseruns0[i,], by = c("id" = "r1_id")) %>%
+        pull(ELO)
+      cur_cELO <- catchers0 %>%
+        inner_join(baseruns0[i,], by = c("id" = "pos2_fld_id")) %>%
+        pull(ELO)
+      cur_pELO <- pitchers0 %>%
+        inner_join(baseruns0[i,], by = c("id" = "pit_id")) %>%
+        pull(ELO)
+      
+      # combine catcher and pitcher into one
+      p_weight <- .7
+      cur_dELO <- (p_weight*cur_pELO) + ((1-p_weight)*cur_cELO) # taken from fangraphs article, lines up decently with my regression too
+      
+      # who won?
+      rwin <- ifelse(baseruns0[i,"Event1"] == "SB", 1, 0)
+      
+      # squishing parameter
+      s <- 100
+      
+      # tie goes to the runner
+      # if(baseruns0[i, "Base1"] == 2){
+      #   radv <- -log(1/3)*s
+      # }else{
+      #   if(baseruns0[i, "Base1"] == 3){
+      #     radv <- -log(1/4)*s
+      #   }else{
+      #     radv <- -log(4)*s
+      #     p_weight <- .9
+      #   }
+      # }
+      
+      if(baseruns0[i, "Base1"] == 2){
+        p <- bayes_sb_rates(baseruns0)$Second
+        radv <- -log((1-p)/p)*s
+      }else{
+        if(baseruns0[i, "Base1"] == 3){
+          p <- bayes_sb_rates(baseruns0)$Third
+          radv <- -log((1-p)/p)*s
+        }else{
+          p <- bayes_sb_rates(baseruns0)$Home
+          radv <- -log((1-p)/p)*s
+          p_weight <- .9
+        }
+      }
+      
+      # who did we expect to win?
+      erwin <- 1/(1+exp((cur_dELO - cur_rELO - radv)/s))
+      
+      # updating rate
+      k <- 25
+      
+      # new ELO values
+      new_rELO <- cur_rELO + k*(rwin - erwin)
+      new_dELO <- cur_dELO - (new_rELO-cur_rELO)
+      # 70-30
+      new_pELO <- cur_pELO + (new_dELO-cur_dELO)*(p_weight/((p_weight^2)+((1-p_weight)^2)))
+      new_cELO <- cur_cELO + (new_dELO-cur_dELO)*((1-p_weight)/((p_weight^2)+((1-p_weight)^2)))
+      
+      # logging the transaction
+      runlog0[i, 7:13] <- c(cur_rELO, cur_cELO, cur_pELO, erwin, new_rELO, new_cELO, new_pELO)
+      
+      # updating reference tables
+      runners0[which(runners0$id == baseruns0[i,"r1_id"]), "ELO"] <- new_rELO
+      catchers0[which(catchers0$id == baseruns0[i,"pos2_fld_id"]), "ELO"] <- new_cELO
+      pitchers0[which(pitchers0$id == baseruns0[i,"pit_id"]), "ELO"] <- new_pELO
+    }
+    
+    runlog0 <- runlog0 %>%
+      mutate(delta_rELO = post_rELO-pre_rELO,
+             delta_cELO = post_cELO-pre_cELO,
+             delta_pELO = post_pELO-pre_pELO)
+    
+    # check to see if this makes sense
+    runners0 <- baseruns0 %>% 
+      group_by(r1_id, Event1) %>% 
+      summarize(count = n()) %>%
+      as.data.frame() %>%
+      reshape2::dcast(r1_id ~ Event1) %>%
+      mutate(SB = if_else(is.na(SB), as.double(0), as.double(SB)),
+             CS = if_else(is.na(CS), as.double(0), as.double(CS))) %>%
+      inner_join(runners0, by = c("r1_id" = "id")) %>%
+      rename(id = r1_id)
+    
+    catchers0 <- baseruns0 %>% 
+      group_by(pos2_fld_id, Event1) %>% 
+      summarize(count = n()) %>%
+      as.data.frame() %>%
+      reshape2::dcast(pos2_fld_id ~ Event1) %>%
+      mutate(SB = if_else(is.na(SB), as.double(0), as.double(SB)),
+             CS = if_else(is.na(CS), as.double(0), as.double(CS))) %>%
+      inner_join(catchers0, by = c("pos2_fld_id" = "id")) %>%
+      rename(id = pos2_fld_id)
+    
+    pitchers0 <- baseruns0 %>% 
+      group_by(pit_id, Event1) %>% 
+      summarize(count = n()) %>%
+      as.data.frame() %>%
+      reshape2::dcast(pit_id ~ Event1) %>%
+      mutate(SB = if_else(is.na(SB), as.double(0), as.double(SB)),
+             CS = if_else(is.na(CS), as.double(0), as.double(CS))) %>%
+      inner_join(pitchers0, by = c("pit_id" = "id")) %>%
+      rename(id = pit_id)
+  }else{
+    # Next Season ----
+    alldat <- read_csv(paste0("~/download.folder/unzipped/all", year, ".csv"))
+  
+    events <- alldat %>% 
+      filter(grepl("SB",event_tx) | grepl("PO", event_tx) | grepl("CS", event_tx))
+    
+    baseruns <- events %>%
+      group_by(1:nrow(.)) %>%
+      mutate(Event1 = case_when(grepl("POCS", event_tx) ~ "POCS",
+                                grepl("PO", event_tx) ~ "PO",
+                                grepl("CS", event_tx) ~ "CS",
+                                grepl("SB", event_tx) ~ "SB",
+                                TRUE ~ "FIX ME"),
+             Base1 = case_when(grepl("POCS", event_tx) ~ substr(strsplit(event_tx, "POCS")[[1]][2],1,1),
+                               grepl("PO", event_tx) ~ substr(strsplit(event_tx, "PO")[[1]][2],1,1),
+                               grepl("CS", event_tx) ~ substr(strsplit(event_tx, "CS")[[1]][2],1,1),
+                               grepl("SB", event_tx) ~ substr(strsplit(event_tx, "SB")[[1]][2],1,1),
+                               TRUE ~ "FIX ME"),
+             r1_id = case_when(Event1 %in% c("POCS", "CS", "SB") & Base1 == "H" ~ base3_run_id,
+                               Event1 %in% c("POCS", "CS", "SB") & Base1 == "3" ~ base2_run_id,
+                               Event1 %in% c("POCS", "CS", "SB") & Base1 == "2" ~ base1_run_id,
+                               Event1 == "PO" & Base1 == "3" ~ base3_run_id,
+                               Event1 == "PO" & Base1 == "2" ~ base2_run_id,
+                               Event1 == "PO" & Base1 == "1" ~ base1_run_id,
+                               TRUE ~ "FIX ME"),
+             Event2 = case_when(length(strsplit(event_tx, "SB")[[1]]) > 2 ~ "SB",
+                                length(strsplit(event_tx, "POCS")[[1]]) > 2 ~ "FIX ME",
+                                length(strsplit(event_tx, "PO")[[1]]) > 2 ~ "FIX ME",
+                                length(strsplit(event_tx, "CS")[[1]]) > 2 ~ "FIX ME",
+                                TRUE ~ NA_character_),
+             Base2 = case_when(length(strsplit(event_tx, "SB")[[1]]) > 2  & grepl("SB", event_tx) ~ substr(strsplit(event_tx, "SB")[[1]][3],1,1),
+                               length(strsplit(event_tx, "POCS")[[1]]) > 2 ~ "FIX ME",
+                               length(strsplit(event_tx, "PO")[[1]]) > 2 ~ "FIX ME",
+                               length(strsplit(event_tx, "CS")[[1]]) > 2 ~ "FIX ME",
+                               TRUE ~ NA_character_),
+             r2_id = case_when(!is.na(Event2) & Event2 == "SB" & Base2 == "H" ~ base3_run_id,
+                               !is.na(Event2) & Event2 == "SB" & Base2 == "3" ~ base2_run_id,
+                               !is.na(Event2) & Event2 == "SB" & Base2 == "2" ~ base1_run_id,
+                               !is.na(Event2) ~ "FIX ME",
+                               TRUE ~ NA_character_),
+             primary_defender = case_when(grepl("POCS", event_tx) ~ substr(strsplit(event_tx, "POCS")[[1]][2],3,3),
+                                          grepl("PO", event_tx) ~ substr(strsplit(event_tx, "PO")[[1]][2],3,3),
+                                          grepl("CS", event_tx) ~ substr(strsplit(event_tx, "CS")[[1]][2],3,3),
+                                          grepl("SB", event_tx) ~ NA_character_,
+                                          TRUE ~ "FIX ME"),
+             game_date = substr(game_id, 4, nchar(game_id))) %>%
+      as.data.frame() %>%
+      select(game_date, pit_id, pos2_fld_id, r1_id, Base1, Event1, r2_id, Base2, Event2, primary_defender) %>%
+      arrange(game_date) %>%
+      filter(Event1 %in% c("SB", "CS")) # cutting out pickoffs, they are kind of ambiguous with the number of throws that happen
+    
+    # single or double steal?
+    for(i in 1:nrow(baseruns)){
+      if(is.na(baseruns[i,"r2_id"])){
+        r_id <- "r1_id"
+        base <- "Base1"
+        event <- "Event1"
+      }else{
+        base1 <- baseruns[i,"Base1"]
+        base2 <- baseruns[i,"Base2"]
+        primary_runner <- case_when(base2 == "H" & base1 == 2 ~ 1,
+                                    base1 == "H" & base2 == 2 ~ 2,
+                                    base2 == "H" ~ 2,
+                                    base1 == "H" ~ 1,
+                                    base1 == 2 ~ 2,
+                                    base1 == 3 ~ 1)
+        r_id <- paste0("r", primary_runner, "_id")
+        base <- paste0("Base", primary_runner)
+        event <- paste0("Event", primary_runner)
+      }
+      baseruns[i, c("r1_id", "Base1", "Event1")] <- baseruns[i, c(r_id, base, event)]
+    }
+    baseruns <- baseruns %>% select(-r2_id, -Base2, -Event2)
+    
+    runners <- data.frame(id = unique(c(baseruns$r1_id, baseruns$r2_id)), stringsAsFactors = F) %>%
+      left_join(runners0 %>% select(id, ELO), by = c("id" = "id")) %>%
+      mutate(ELO = if_else(is.na(ELO), 1000, sqrt(ELO)*sqrt(1000)))
+    catchers <- data.frame(id = unique(baseruns$pos2_fld_id), stringsAsFactors = F) %>%
+      left_join(catchers0 %>% select(id, ELO), by = c("id" = "id")) %>%
+      mutate(ELO = if_else(is.na(ELO), 1000, sqrt(ELO)*sqrt(1000)))
+    pitchers <- data.frame(id = unique(baseruns$pit_id), stringsAsFactors = F) %>%
+      left_join(pitchers0 %>% select(id, ELO), by = c("id" = "id")) %>%
+      mutate(ELO = if_else(is.na(ELO), 1000, sqrt(ELO)*sqrt(1000)))
+    
+    runlog <- baseruns %>%
+      select(game_date, r1_id, pos2_fld_id, pit_id, Base1, Event1) %>%
+      mutate(pre_rELO = 0,
+           pre_cELO = 0,
+           pre_pELO = 0,
+           prob_safe = 0,
+           post_rELO = 0,
+           post_cELO = 0,
+           post_pELO = 0)
+  
+    for(i in 1:nrow(baseruns)){
+      # starting ELO values
+      cur_rELO <- runners %>%
+        inner_join(baseruns[i,], by = c("id" = "r1_id")) %>%
+        pull(ELO)
+      cur_cELO <- catchers %>%
+        inner_join(baseruns[i,], by = c("id" = "pos2_fld_id")) %>%
+        pull(ELO)
+      cur_pELO <- pitchers %>%
+        inner_join(baseruns[i,], by = c("id" = "pit_id")) %>%
+        pull(ELO)
+      
+      # combine catcher and pitcher into one
+      p_weight <- .7
+      cur_dELO <- (p_weight*cur_pELO) + ((1-p_weight)*cur_cELO) # taken from fangraphs article, lines up decently with my regression too
+      
+      # who won?
+      rwin <- ifelse(baseruns[i,"Event1"] == "SB", 1, 0)
+      
+      # squishing parameter
+      s <- 100
+      
+      # tie goes to the runner
+      # if(baseruns[i, "Base1"] == 2){
+      #   radv <- -log(1/3)*s
+      # }else{
+      #   if(baseruns[i, "Base1"] == 3){
+      #     radv <- -log(1/4)*s
+      #   }else{
+      #     radv <- -log(4)*s
+      #     p_weight <- .9
+      #   }
+      # }
+      if(baseruns[i, "Base1"] == 2){
+        p <- bayes_sb_rates(baseruns)$Second
+        radv <- -log((1-p)/p)*s
+      }else{
+        if(baseruns[i, "Base1"] == 3){
+          p <- bayes_sb_rates(baseruns)$Third
+          radv <- -log((1-p)/p)*s
+        }else{
+          p <- bayes_sb_rates(baseruns)$Home
+          radv <- -log((1-p)/p)*s
+          p_weight <- .9
+        }
+      }
+      
+      # who did we expect to win?
+      erwin <- 1/(1+exp((cur_dELO - cur_rELO - radv)/s))
+      
+      # updating rate
+      k <- 25
+      
+      # new ELO values
+      new_rELO <- cur_rELO + k*(rwin - erwin)
+      new_dELO <- cur_dELO - (new_rELO-cur_rELO)
+      # 70-30
+      new_pELO <- cur_pELO + (new_dELO-cur_dELO)*(p_weight/((p_weight^2)+((1-p_weight)^2)))
+      new_cELO <- cur_cELO + (new_dELO-cur_dELO)*((1-p_weight)/((p_weight^2)+((1-p_weight)^2)))
+      
+      # logging the transaction
+      runlog[i, 7:13] <- c(cur_rELO, cur_cELO, cur_pELO, erwin, new_rELO, new_cELO, new_pELO)
+      
+      # updating reference tables
+      runners[which(runners$id == baseruns[i,"r1_id"]), "ELO"] <- new_rELO
+      catchers[which(catchers$id == baseruns[i,"pos2_fld_id"]), "ELO"] <- new_cELO
+      pitchers[which(pitchers$id == baseruns[i,"pit_id"]), "ELO"] <- new_pELO
+    }
+    runlog <- runlog %>%
+      mutate(delta_rELO = post_rELO-pre_rELO,
+             delta_cELO = post_cELO-pre_cELO,
+             delta_pELO = post_pELO-pre_pELO) %>%
+      group_by(1:nrow(.)) %>%
+      mutate(game_date = as.Date(substr(game_date, 1, nchar(game_date)-1), format = "%Y%m%d")) %>%
+      as.data.frame()
+    
+    # check to see if this makes sense
+    runners <- baseruns %>% 
+      group_by(r1_id, Event1) %>% 
+      summarize(count = n()) %>%
+      as.data.frame() %>%
+      reshape2::dcast(r1_id ~ Event1) %>%
+      mutate(SB = if_else(is.na(SB), as.double(0), as.double(SB)),
+             CS = if_else(is.na(CS), as.double(0), as.double(CS))) %>%
+      inner_join(runners, by = c("r1_id" = "id")) %>%
+      rename(id = r1_id)
+    
+    catchers <- baseruns %>% 
+      group_by(pos2_fld_id, Event1) %>% 
+      summarize(count = n()) %>%
+      as.data.frame() %>%
+      reshape2::dcast(pos2_fld_id ~ Event1) %>%
+      mutate(SB = if_else(is.na(SB), as.double(0), as.double(SB)),
+             CS = if_else(is.na(CS), as.double(0), as.double(CS))) %>%
+      inner_join(catchers, by = c("pos2_fld_id" = "id")) %>%
+      rename(id = pos2_fld_id)
+    
+    pitchers <- baseruns %>% 
+      group_by(pit_id, Event1) %>% 
+      summarize(count = n()) %>%
+      as.data.frame() %>%
+      reshape2::dcast(pit_id ~ Event1) %>%
+      mutate(SB = if_else(is.na(SB), as.double(0), as.double(SB)),
+             CS = if_else(is.na(CS), as.double(0), as.double(CS))) %>%
+      inner_join(pitchers, by = c("pit_id" = "id")) %>%
+      rename(id = pit_id)
+    
+    # historic tracking----
+    historic_runners <- historic_runners %>%
+      bind_rows(runners %>% mutate(Season = year))
+    historic_pitchers <- historic_pitchers %>%
+      bind_rows(pitchers %>% mutate(Season = year))
+    historic_catchers <- historic_catchers %>%
+      bind_rows(catchers %>% mutate(Season = year))
+    historic_runlog <- historic_runlog %>%
+        bind_rows(runlog)
+    
+    # plant seed----
+    if(year != last_year){
+      runners0 <- runners
+      pitchers0 <- pitchers
+      catchers0 <- catchers
+    }
+  }
+}
+```
+
+```{r Player Names, message=FALSE, warning=FALSE}
+for(year in first_year:last_year){
+  if(year > first_year){
+    player_info <- player_info %>%
+      bind_rows(read_csv(paste0("~/download.folder/unzipped/roster", year, ".csv")) %>% select(player_id, first_name, last_name))
+  }else{
+    player_info <- read_csv(paste0("~/download.folder/unzipped/roster", year, ".csv")) %>%
+      select(player_id, first_name, last_name)
+  }
+}
+player_info <- player_info %>% group_by(player_id) %>% summarize(first_name = last(first_name), last_name = last(last_name)) %>% as.data.frame()
+
+historic_runners <- historic_runners %>%
+  left_join(player_info, by = c("id" = "player_id")) %>%
+  mutate(Name = paste(first_name, last_name)) %>%
+  select(-first_name, -last_name)
+
+historic_catchers <- historic_catchers %>%
+  left_join(player_info, by = c("id" = "player_id")) %>%
+  mutate(Name = paste(first_name, last_name)) %>%
+  select(-first_name, -last_name)
+
+historic_pitchers <- historic_pitchers %>%
+  left_join(player_info, by = c("id" = "player_id")) %>%
+  mutate(Name = paste(first_name, last_name)) %>%
+  select(-first_name, -last_name)
+```
+
+```{r Leaderboard}
+historic_runners %>%
+  arrange(desc(ELO)) %>%
+  mutate(ELO = round(ELO)) %>%
+  select(Name, Season, SB, CS, ELO) %>%
+  head(100) %>%
+  DT::datatable(caption = "Best Runners by sbELO")
+historic_runners %>%
+  filter(ELO > 0) %>%
+  arrange(ELO) %>%
+  mutate(ELO = round(ELO)) %>%
+  select(Name, Season, SB, CS, ELO) %>%
+  head(100) %>%
+  DT::datatable(caption = "Worst Runners by sbELO")
+
+historic_pitchers %>%
+  arrange(desc(ELO)) %>%
+  mutate(ELO = round(ELO)) %>%
+  select(Name, Season, SB, CS, ELO) %>%
+  head(100) %>%
+  DT::datatable(caption = "Best Pitchers by sbELO")
+historic_pitchers %>%
+  filter(ELO > 0) %>%
+  arrange(ELO) %>%
+  mutate(ELO = round(ELO)) %>%
+  select(Name, Season, SB, CS, ELO) %>%
+  head(100) %>%
+  DT::datatable(caption = "Worst Pitchers by sbELO")
+
+historic_catchers %>%
+  arrange(desc(ELO)) %>%
+  mutate(ELO = round(ELO)) %>%
+  select(Name, Season, SB, CS, ELO) %>%
+  head(100) %>%
+  DT::datatable(caption = "Best Catchers by sbELO")
+historic_catchers %>%
+  filter(ELO > 0) %>%
+  arrange(ELO) %>%
+  mutate(ELO = round(ELO)) %>%
+  select(Name, Season, SB, CS, ELO) %>%
+  head(100) %>%
+  DT::datatable(caption = "Worst Catchers by sbELO")
+```
+
+```{r Side by Side All Time}
+historic_pitchers %>%
+  arrange(desc(ELO)) %>%
+  head(25) %>%
+  mutate(ELO = round(ELO)) %>%
+  select(Name, Season, SB, CS, ELO) %>%
+  kable("html", caption = "Best Pitchers by sbELO", row.names = T) %>%
+  kable_styling(full_width = F, position = "float_left")
+historic_pitchers %>%
+  filter(ELO > 0) %>%
+  arrange(ELO) %>%
+  head(25) %>%
+  mutate(ELO = round(ELO)) %>%
+  select(Name, Season, SB, CS, ELO) %>%
+  kable("html", caption = "Worst Pitchers by sbELO") %>%
+  kable_styling(full_width = F, position = "right")
+
+historic_runners %>%
+  arrange(desc(ELO)) %>%
+  head(25) %>%
+  mutate(ELO = round(ELO)) %>%
+  select(Name, Season, SB, CS, ELO) %>%
+  kable("html", caption = "Best Runners by sbELO", row.names = T) %>%
+  kable_styling(full_width = F, position = "float_left")
+historic_runners %>%
+  filter(ELO > 0) %>%
+  arrange(ELO) %>%
+  head(25) %>%
+  mutate(ELO = round(ELO)) %>%
+  select(Name, Season, SB, CS, ELO) %>%
+  kable("html", caption = "Worst Runners by sbELO") %>%
+  kable_styling(full_width = F, position = "right")
+
+historic_catchers %>%
+  arrange(desc(ELO)) %>%
+  head(25) %>%
+  mutate(ELO = round(ELO)) %>%
+  select(Name, Season, SB, CS, ELO) %>%
+  kable("html", caption = "Best Catchers by sbELO", row.names = T) %>%
+  kable_styling(full_width = F, position = "float_left")
+historic_catchers %>%
+  filter(ELO > 0) %>%
+  arrange(ELO) %>%
+  head(25) %>%
+  mutate(ELO = round(ELO)) %>%
+  select(Name, Season, SB, CS, ELO) %>%
+  kable("html", caption = "Worst Catchers by sbELO") %>%
+  kable_styling(full_width = F, position = "right")
+```
+
+
+```{r BigSim RE Graph, cache=TRUE}
+showcase_ids <- c("hamib001", "hendr001", "suzui001", "loftk001", "ellsj001")
+historic_runlog %>% 
+  filter(r1_id %in% showcase_ids) %>%
+  group_by(r1_id) %>%
+  ggplot(aes(x = game_date, y = post_rELO, group = r1_id, color = r1_id)) + 
+  geom_step() + 
+  geom_step(data = historic_runlog %>% 
+              filter(!r1_id %in% showcase_ids,
+                     r1_id != "") %>%
+              group_by(r1_id),
+            aes(x = game_date, y = post_rELO, group = r1_id),
+            color = "gray",
+            alpha = 0.1) +
+  theme_classic() #+
+  # theme(legend.position = "none")
+```
+
+```{r ELO Above Average}
+historic_runners %>%
+  filter(ELO > 0) %>%
+  group_by(id, Name) %>%
+  summarize(Years = n(),
+            ELO = sum(ELO)) %>%
+  as.data.frame() %>%
+  mutate(EAA = round(ELO - 1000*Years),
+         ELO = round(ELO)) %>%
+  arrange(desc(EAA)) %>%
+  select(-id) %>%
+  head(25) %>%
+  kable("html", caption = "Best Runners by sbELO Above Average", row.names = T) %>%
+  kable_styling(full_width = F, position = "float_left")
+historic_catchers %>%
+  filter(ELO > 0) %>%
+  group_by(id, Name) %>%
+  summarize(Years = n(),
+            ELO = sum(ELO)) %>%
+  as.data.frame() %>%
+  mutate(EAA = round(ELO - 1000*Years),
+         ELO = round(ELO)) %>%
+  arrange(desc(EAA)) %>%
+  select(-id) %>%
+  head(25) %>%
+  kable("html", caption = "Best Catchers by sbELO Above Average", row.names = F) %>%
+  kable_styling(full_width = F, position = "float_right")
+historic_pitchers %>%
+  filter(ELO > 0) %>%
+  group_by(id, Name) %>%
+  summarize(Years = n(),
+            ELO = sum(ELO)) %>%
+  as.data.frame() %>%
+  mutate(EAA = round(ELO - 1000*Years),
+         ELO = round(ELO)) %>%
+  arrange(desc(EAA)) %>%
+  select(-id) %>%
+  head(25) %>%
+  kable("html", caption = "Best Pitchers by sbELO Above Average", row.names = F) %>%
+  kable_styling(full_width = F, position = "center")
+```
+
+```{r Leaderboard 2019, eval=F}
+historic_runners %>%
+  filter(Season == 2019) %>%
+  arrange(desc(ELO)) %>%
+  mutate(ELO = round(ELO)) %>%
+  select(Name, SB, CS, ELO) %>%
+  DT::datatable(caption = "Best Runners by sbELO")
+historic_runners %>%
+  filter(ELO > 0,
+         Season == 2019) %>%
+  arrange(ELO) %>%
+  mutate(ELO = round(ELO)) %>%
+  select(Name, SB, CS, ELO) %>%
+  DT::datatable(caption = "Worst Runners by sbELO")
+
+historic_pitchers %>%
+  filter(Season == 2019) %>%
+  arrange(desc(ELO)) %>%
+  mutate(ELO = round(ELO)) %>%
+  select(Name, SB, CS, ELO) %>%
+  DT::datatable(caption = "Best Pitchers by sbELO")
+historic_pitchers %>%
+  filter(ELO > 0,
+         Season == 2019) %>%
+  arrange(ELO) %>%
+  mutate(ELO = round(ELO)) %>%
+  select(Name, SB, CS, ELO) %>%
+  DT::datatable(caption = "Worst Pitchers by sbELO")
+
+historic_catchers %>%
+  filter(Season == 2019) %>%
+  arrange(desc(ELO)) %>%
+  mutate(ELO = round(ELO)) %>%
+  select(Name, SB, CS, ELO) %>%
+  DT::datatable(caption = "Best Catchers by sbELO")
+historic_catchers %>%
+  filter(ELO > 0,
+         Season == 2019) %>%
+  arrange(ELO) %>%
+  mutate(ELO = round(ELO)) %>%
+  select(Name, SB, CS, ELO) %>%
+  DT::datatable(caption = "Worst Catchers by sbELO")
+```
+
+```{r Two Columns 2019, eval=F}
+historic_pitchers %>%
+  filter(Season == 2019) %>%
+  arrange(desc(ELO)) %>%
+  head(25) %>%
+  mutate(ELO = round(ELO)) %>%
+  select(Name, SB, CS, ELO) %>%
+  kable("html", caption = "Best Pitchers by sbELO", row.names = T) %>%
+  kable_styling(full_width = F, position = "float_left")
+historic_pitchers %>%
+  filter(ELO > 0,
+         Season == 2019) %>%
+  arrange(ELO) %>%
+  head(25) %>%
+  mutate(ELO = round(ELO)) %>%
+  select(Name, SB, CS, ELO) %>%
+  kable("html", caption = "Worst Pitchers by sbELO") %>%
+  kable_styling(full_width = F, position = "right")
+
+historic_runners %>%
+  filter(Season == 2019) %>%
+  arrange(desc(ELO)) %>%
+  head(25) %>%
+  mutate(ELO = round(ELO)) %>%
+  select(Name, SB, CS, ELO) %>%
+  kable("html", caption = "Best Runners by sbELO", row.names = T) %>%
+  kable_styling(full_width = F, position = "float_left")
+historic_runners %>%
+  filter(ELO > 0,
+         Season == 2019) %>%
+  arrange(ELO) %>%
+  head(25) %>%
+  mutate(ELO = round(ELO)) %>%
+  select(Name, SB, CS, ELO) %>%
+  kable("html", caption = "Worst Runners by sbELO") %>%
+  kable_styling(full_width = F, position = "right")
+
+historic_catchers %>%
+  filter(Season == 2019) %>%
+  arrange(desc(ELO)) %>%
+  head(25) %>%
+  mutate(ELO = round(ELO)) %>%
+  select(Name, SB, CS, ELO) %>%
+  kable("html", caption = "Best Catchers by sbELO", row.names = T) %>%
+  kable_styling(full_width = F, position = "float_left")
+historic_catchers %>%
+  filter(ELO > 0,
+         Season == 2019) %>%
+  arrange(ELO) %>%
+  head(25) %>%
+  mutate(ELO = round(ELO)) %>%
+  select(Name, SB, CS, ELO) %>%
+  kable("html", caption = "Worst Catchers by sbELO") %>%
+  kable_styling(full_width = F, position = "right")
+```
+
+```{r Three Columns 2019}
+historic_runners %>%
+  filter(Season == 2019) %>%
+  arrange(desc(ELO)) %>%
+  head(25) %>%
+  mutate(ELO = round(ELO)) %>%
+  select(Name, SB, CS, ELO) %>%
+  kable("html", caption = "Best Runners by sbELO", row.names = T) %>%
+  kable_styling(full_width = F, position = "float_left")
+historic_catchers %>%
+  filter(Season == 2019) %>%
+  arrange(desc(ELO)) %>%
+  head(25) %>%
+  mutate(ELO = round(ELO)) %>%
+  select(Name, SB, CS, ELO) %>%
+  kable("html", caption = "Best Catchers by sbELO", row.names = F) %>%
+  kable_styling(full_width = F, position = "float_right")
+historic_pitchers %>%
+  filter(Season == 2019) %>%
+  arrange(desc(ELO)) %>%
+  head(25) %>%
+  mutate(ELO = round(ELO)) %>%
+  select(Name, SB, CS, ELO) %>%
+  kable("html", caption = "Best Pitchers by sbELO", row.names = F) %>%
+  kable_styling(full_width = F, position = "center")
+
+
+
+historic_runners %>%
+  filter(ELO > 0,
+         Season == 2019) %>%
+  arrange(ELO) %>%
+  head(25) %>%
+  mutate(ELO = round(ELO)) %>%
+  select(Name, SB, CS, ELO) %>%
+  kable("html", caption = "Worst Runners by sbELO", row.names = T) %>%
+  kable_styling(full_width = F, position = "float_left")
+historic_catchers %>%
+  filter(ELO > 0,
+         Season == 2019) %>%
+  arrange(ELO) %>%
+  head(25) %>%
+  mutate(ELO = round(ELO)) %>%
+  select(Name, SB, CS, ELO) %>%
+  kable("html", caption = "Worst Catchers by sbELO") %>%
+  kable_styling(full_width = F, position = "float_right")
+historic_pitchers %>%
+  filter(ELO > 0,
+         Season == 2019) %>%
+  arrange(ELO) %>%
+  head(25) %>%
+  mutate(ELO = round(ELO)) %>%
+  select(Name, SB, CS, ELO) %>%
+  kable("html", caption = "Worst Pitchers by sbELO") %>%
+  kable_styling(full_width = F, position = "center")
+```
+
+```{r Three Columns All Time}
+historic_runners %>%
+  arrange(desc(ELO)) %>%
+  head(25) %>%
+  mutate(ELO = round(ELO)) %>%
+  select(Name, Season, SB, CS, ELO) %>%
+  rename(Year = Season) %>%
+  kable("html", caption = "Best Runners by sbELO", row.names = T) %>%
+  kable_styling(full_width = F, position = "float_left", font_size = 13.5)
+historic_catchers %>%
+  arrange(desc(ELO)) %>%
+  head(25) %>%
+  mutate(ELO = round(ELO)) %>%
+  select(Name, Season, SB, CS, ELO) %>%
+  rename(Year = Season) %>%
+  kable("html", caption = "Best Catchers by sbELO", row.names = F) %>%
+  kable_styling(full_width = F, position = "float_right", font_size = 13.5)
+historic_pitchers %>%
+  arrange(desc(ELO)) %>%
+  head(25) %>%
+  mutate(ELO = round(ELO)) %>%
+  select(Name, Season, SB, CS, ELO) %>%
+  rename(Year = Season) %>%
+  kable("html", caption = "Best Pitchers by sbELO", row.names = F) %>%
+  kable_styling(full_width = F, position = "center", font_size = 13.5)
+
+
+
+historic_runners %>%
+  filter(ELO > 0) %>%
+  arrange(ELO) %>%
+  head(25) %>%
+  mutate(ELO = round(ELO)) %>%
+  select(Name, Season, SB, CS, ELO) %>%
+  rename(Year = Season) %>%
+  kable("html", caption = "Worst Runners by sbELO", row.names = T) %>%
+  kable_styling(full_width = F, position = "float_left", font_size = 13.5)
+historic_catchers %>%
+  filter(ELO > 0) %>%
+  arrange(ELO) %>%
+  head(25) %>%
+  mutate(ELO = round(ELO)) %>%
+  select(Name, Season, SB, CS, ELO) %>%
+  rename(Year = Season) %>%
+  kable("html", caption = "Worst Catchers by sbELO") %>%
+  kable_styling(full_width = F, position = "float_right", font_size = 13.5)
+historic_pitchers %>%
+  filter(ELO > 0) %>%
+  arrange(ELO) %>%
+  head(25) %>%
+  mutate(ELO = round(ELO)) %>%
+  select(Name, Season, SB, CS, ELO) %>%
+  rename(Year = Season) %>%
+  kable("html", caption = "Worst Pitchers by sbELO") %>%
+  kable_styling(full_width = F, position = "center", font_size = 13.5)
+```
+
+```{r Save Data}
+write.csv(historic_catchers, file = "sbelo_historic_catchers.csv")
+write.csv(historic_pitchers, file = "sbelo_historic_pitchers.csv")
+write.csv(historic_runners, file = "sbelo_historic_runners.csv")
+```
+
